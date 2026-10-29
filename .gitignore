@@ -1,11 +1,10 @@
-# build artifacts
-build/
+# build artifacts (keep the build script, ignore its output)
+build/*.obj
+build/*.EFI
+build/*.efi
+build/*.pdb
+build/*.ilk
 build_step.bat
-*.obj
-*.EFI
-*.efi
-*.pdb
-*.ilk
 
 # upstream source tree (clone it yourself)
 source/
