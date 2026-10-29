@@ -1,0 +1,18 @@
+# build artifacts
+build/
+build_step.bat
+*.obj
+*.EFI
+*.efi
+*.pdb
+*.ilk
+
+# upstream source tree (clone it yourself)
+source/
+
+# firmware assets (never distributed)
+*.bin
+
+# local scratch
+*.log
+*.tmp
