@@ -1,5 +1,7 @@
 # ad103-win-uefi-port — RTX 4080 16 GB (AD103) + ASRock Z390, Windows 11
 
+**English** | [简体中文](README.zh-CN.md)
+
 A reproducible record of porting an existing UEFI tensor-rate unlock to a machine nobody had
 documented: a retail **RTX 4080 16 GB (`10de:2704`)** on an **ASRock Z390 Taichi** running
 **Windows 11**, with no iGPU and a second GPU providing the console.
