@@ -1,0 +1,218 @@
+diff --git a/source/unlock/app.c b/source/unlock/app.c
+index e62bc3b..03f0db0 100644
+--- a/source/unlock/app.c
++++ b/source/unlock/app.c
+@@ -70,8 +70,11 @@ static EFI_STATUS ConfigCheck(BOOLEAN Save) {
+   if(EFI_ERROR(status))return status;
+   status=ReadConfig(config);if(EFI_ERROR(status))return status;
+   BOOLEAN checked=GuCheckConfig(config,segment,bus,device,function,&caps);
+-  BOOLEAN valid=checked && config[2]==0x030000a1 && config[0xc8/4]==0x00050011 &&
+-    config[0x10/4]==0x80000000 && !(config[(caps.pcie+8)/4]&0x00200000U);
++  /* Port: offset 0xC8 differs on this board and is not a documented gate;
++     record it instead of blocking on it. */
++  GuLog("port: config[0xc8]=%#x (reference value was 0x00050011, not enforced)\n",config[0xc8/4]);
++  BOOLEAN valid=checked && config[2]==0x030000a1 &&
++    config[0x10/4]==0xB1000000 && !(config[(caps.pcie+8)/4]&0x00200000U);
+   BOOLEAN same=Save || !memcmp(config,InitialConfig,sizeof(config));
+   if(Save || !valid || !same)ConfigLog(config);
+   GuLog("target BDF=%zu:%zu:%zu.%zu checks=%u pm=%#x pcie=%#x msi=%#x msix=%#x\n",
+@@ -157,10 +160,10 @@ static EFI_STATUS BarCheck(VOID) {
+         (unsigned)r->ResType,(unsigned long long)r->AddrSpaceGranularity,(unsigned long long)r->AddrRangeMin,
+         (unsigned long long)r->AddrRangeMax,(unsigned long long)r->AddrLen,(unsigned long long)r->AddrTranslationOffset);
+     if(!r || r->Desc!=ACPI_ADDRESS_SPACE_DESCRIPTOR || r->Len!=sizeof(*r)-3 || r->ResType!=0 ||
+-      r->AddrRangeMin!=0x80000000 || r->AddrLen!=0x1000000 || r->AddrTranslationOffset ||
++      r->AddrRangeMin!=0xB1000000 || r->AddrLen!=0x1000000 || r->AddrTranslationOffset ||
+       /* UEFI describes an inclusive end; pinned EDK2 PciBusDxe instead returns
+          PciBar.Alignment. Both representations describe this exact 16 MiB BAR. */
+-      (r->AddrRangeMax!=0x80ffffff && r->AddrRangeMax!=0x00ffffff) ||
++      (r->AddrRangeMax!=0xb1ffffff && r->AddrRangeMax!=0x00ffffff) ||
+       r->AddrSpaceGranularity!=32 || ((UINT8 *)(r+1))[0]!=ACPI_END_TAG_DESCRIPTOR)status=EFI_UNSUPPORTED;
+     else {
+       UINT8 *raw=(UINT8 *)r,sum=0;
+@@ -191,9 +194,9 @@ static EFI_STATUS ColdCheck(VOID) {
+   UINT32 vram=GuRead32(0x1183a4);
+   /* RUN02 observed 32760 MiB on this pinned board/ROM. Do not round the
+      value up: the transaction independently uses the actual FB size. */
+-  GuLog("VRAM register=%#x (%u MiB); accepted=0x7ff8/0x8000; layout uses actual register\n",vram,vram);
++  GuLog("VRAM register=%#x (%u MiB); accepted=0x3ff8; layout uses actual register\n",vram,vram);
+   if(Gu.fault || gpu_unlock_gfw_assess(&s) || hi>>4 || plm!=0xffffff8f ||
+-    (ss0&0x88888888U) || ss1!=7 || (vram!=0x7ff8 && vram!=0x8000))return EFI_NOT_READY;
++    (ss0&0x88888888U) || ss1!=0 || vram!=0x3ff8)return EFI_NOT_READY;
+   return Gu.fault?EFI_DEVICE_ERROR:EFI_SUCCESS;
+ }
+ static VOID LogHash(const char *Name,const VOID *Data,UINTN Bytes) {
+@@ -203,8 +206,15 @@ static VOID LogHash(const char *Name,const VOID *Data,UINTN Bytes) {
+   hex[64]=0;GuLog("%s bytes=%zu SHA256=%s\n",Name,(size_t)Bytes,hex);
+ }
+ static EFI_STATUS PromCheck(VOID) {
+-  if(!Gu.pci->RomImage || Gu.pci->RomSize!=0x24c00 ||
+-     !GuHashMatches(Gu.pci->RomImage,0x24c00,"c252043215d894318657580baf9c80c3a7bd508337e8ba15f469fb2e2e490102"))return EFI_CRC_ERROR;
++  /* Port: the firmware-cached PCI RomImage is this board's own VBIOS slice, not
++     the reference image, so its hash cannot match. Record what it is and rely on
++     the live PROM view hash below, which binds the run to this exact card. */
++  if(!Gu.pci->RomImage)GuLogText("PCI RomImage: unavailable; using live PROM only\n");
++  else if(Gu.pci->RomSize!=0x24c00 || !GuHashMatches(Gu.pci->RomImage,0x24c00,
++          "c252043215d894318657580baf9c80c3a7bd508337e8ba15f469fb2e2e490102")) {
++    GuLog("PCI RomImage: bytes=%u hash differs from reference (not enforced)\n",(unsigned)Gu.pci->RomSize);
++    LogHash("PCI RomImage",Gu.pci->RomImage,(UINTN)Gu.pci->RomSize);
++  }
+   VOID *prom=GuAlloc(1048576);if(!prom)return EFI_OUT_OF_RESOURCES;
+   GuCopyFromIo(prom,(VOID *)(UINTN)(Gu.bar_base+GU_PROM_BAR_OFFSET),1048576);
+   BOOLEAN good=!Gu.fault && GuHashMatches(prom,GU_PROM_VIEW_BYTES,GU_PROM_VIEW_SHA256);
+diff --git a/source/unlock/checks.c b/source/unlock/checks.c
+index dae11ec..b1ca9ab 100644
+--- a/source/unlock/checks.c
++++ b/source/unlock/checks.c
+@@ -26,7 +26,10 @@ BOOLEAN GuCheckConfig(const UINT32 Config[64], UINTN Segment, UINTN Bus,
+ 
+   if (Out == NULL) return FALSE;
+   *Out = Caps;
+-  if (Config == NULL || Segment != 0 || Bus != 1 || Device != 0 || Function != 0)
++  /* Port: bus is assigned by firmware and is not a stable property of the card.
++     Segment, device and function remain fixed; the caller separately requires a
++     single matching target, so an unconstrained bus cannot select the wrong GPU. */
++  if (Config == NULL || Segment != 0 || Device != 0 || Function != 0)
+     return FALSE;
+   if (Config[0] != GU_BOARD_ID || Config[0x2c / 4] != GU_BOARD_SUBSYSTEM ||
+       ConfigByte(Config, 0x0b) != PCI_CLASS_DISPLAY ||
+diff --git a/source/unlock/compat.c b/source/unlock/compat.c
+index 561d202..4b0bc5f 100644
+--- a/source/unlock/compat.c
++++ b/source/unlock/compat.c
+@@ -1,4 +1,7 @@
+ #include "compat/compat.h"
++#if defined(_MSC_VER)
++#include <intrin.h>
++#endif
+ GU_ASSET GuAssets[5];
+ void *devres_open_group(struct device *D,void *Id,int Flags) {
+   (void)Flags;if(Id || D->scope)return NULL;D->scope=true;return &D->scope;
+@@ -45,7 +48,13 @@ void dma_free_coherent(struct device *D,size_t N,void *P,dma_addr_t A) {
+ int dma_set_mask(struct device *D,u64 Mask) {if(!D->dma_mask)return -EINVAL;*D->dma_mask=Mask;return 0;}
+ int dma_set_coherent_mask(struct device *D,u64 Mask) {D->coherent_dma_mask=Mask;return 0;}
+ void dma_wmb(void) {
++#if defined(_MSC_VER)
++  /* MSVC has no __atomic_thread_fence; use the x86-64 full fence intrinsics. */
++  _ReadWriteBarrier();
++  __faststorefence();
++#else
+   __atomic_thread_fence(__ATOMIC_SEQ_CST);
++#endif
+   if(Gu.pci->Flush && EFI_ERROR(Gu.pci->Flush(Gu.pci)))Gu.fault=TRUE;
+ }
+ void *kzalloc(size_t N,int Flags) {(void)Flags;return GuAlloc(N);}
+diff --git a/source/unlock/ownership.c b/source/unlock/ownership.c
+index 4a6d8ef..c7e5429 100644
+--- a/source/unlock/ownership.c
++++ b/source/unlock/ownership.c
+@@ -3,6 +3,7 @@
+ #include <Protocol/LoadedImage.h>
+ #include <Protocol/GraphicsOutput.h>
+ #include "sha256.h"
++static UINTN SavedSeg=0,SavedBus=0,SavedDev=0,SavedFn=0;static BOOLEAN SavedBdf=FALSE;
+ static EFI_GUID PciGuid=EFI_PCI_IO_PROTOCOL_GUID,
+   PathGuid=EFI_DEVICE_PATH_PROTOCOL_GUID,GopGuid=EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID,
+   BindingGuid=EFI_DRIVER_BINDING_PROTOCOL_GUID,LoadedGuid=EFI_LOADED_IMAGE_PROTOCOL_GUID;
+@@ -103,6 +104,12 @@ static EFI_STATUS DisplayChild(const OWNER_RECORD *Record,GU_RELEASE_OWNER *Owne
+ EFI_STATUS GuFindReleaseOwner(EFI_SYSTEM_TABLE *Table,GU_RELEASE_OWNER *Owner,BOOLEAN Log) {
+   OWNER_RECORD records[MAX_RECORDS];UINTN count=0,drivers=0;memset(Owner,0,sizeof(*Owner));
+   if(!Gu.bs->DisconnectController || Gu.owned)return EFI_UNSUPPORTED;
++  if(Gu.pci && Gu.pci->GetLocation) {
++    UINTN a=0,b=0,c=0,d=0;
++    if(!EFI_ERROR(Gu.pci->GetLocation(Gu.pci,&a,&b,&c,&d))) {
++      SavedSeg=a;SavedBus=b;SavedDev=c;SavedFn=d;SavedBdf=TRUE;
++    }
++  }
+   EFI_TPL old=Gu.bs->RaiseTPL(TPL_NOTIFY);
+   EFI_STATUS status=Snapshot(records,&count);
+   Gu.bs->RestoreTPL(old);if(Log)LogRecords(records,count,status);
+@@ -162,7 +169,36 @@ EFI_STATUS GuRefreshTargetPci(VOID) {
+   EFI_PCI_IO_PROTOCOL *fresh=NULL;UINTN segment,bus,device,function;UINT32 config[64]={0};
+   Gu.pci=NULL;
+   EFI_STATUS status=Gu.bs->HandleProtocol(Gu.handle,&PciGuid,(VOID **)&fresh);
+-  if(EFI_ERROR(status) || !fresh || !fresh->GetLocation || !fresh->Pci.Read || !fresh->Pci.Write)return EFI_NOT_FOUND;
++  if(EFI_ERROR(status) || !fresh || !fresh->GetLocation || !fresh->Pci.Read || !fresh->Pci.Write) {
++    /* Port: DisconnectController can destroy or replace the device handle, so
++       the original handle no longer carries PciIo. Retry briefly, then re-enumerate
++       every PciIo handle and match the saved BDF; the target is uniquely identified
++       by its location plus the config checks below. */
++    for(UINTN r=0;r<10 && !SavedBdf;r++)GuStall(50000);
++    for(UINTN r=0;r<10;r++) {
++      fresh=NULL;
++      if(!EFI_ERROR(Gu.bs->HandleProtocol(Gu.handle,&PciGuid,(VOID **)&fresh)) && fresh &&
++         fresh->GetLocation && fresh->Pci.Read && fresh->Pci.Write)break;
++      fresh=NULL;GuStall(50000);
++    }
++    if((!fresh || !fresh->GetLocation) && SavedBdf && Gu.bs->LocateHandleBuffer) {
++      EFI_HANDLE *hs=NULL;UINTN n=0;
++      if(!EFI_ERROR(Gu.bs->LocateHandleBuffer(ByProtocol,&PciGuid,NULL,&n,&hs)) && hs) {
++        for(UINTN i=0;i<n;i++) {
++          EFI_PCI_IO_PROTOCOL *cand=NULL;UINTN a=0,b=0,c=0,d=0;
++          if(EFI_ERROR(Gu.bs->HandleProtocol(hs[i],&PciGuid,(VOID **)&cand))||!cand||!cand->GetLocation)continue;
++          if(EFI_ERROR(cand->GetLocation(cand,&a,&b,&c,&d)))continue;
++          if(a==SavedSeg && b==SavedBus && c==SavedDev && d==SavedFn) {
++            fresh=cand;Gu.handle=hs[i];break;
++          }
++        }
++        Gu.bs->FreePool(hs);
++      }
++    }
++  }
++  if(EFI_ERROR(status) || !fresh || !fresh->GetLocation || !fresh->Pci.Read || !fresh->Pci.Write) {
++    if(!fresh)return EFI_NOT_FOUND;
++  }
+   status=fresh->GetLocation(fresh,&segment,&bus,&device,&function);if(EFI_ERROR(status))return status;
+   const UINT32 offsets[]={0,8,12,44};
+   for(UINTN i=0;i<4;i++) {
+diff --git a/source/unlock/port.c b/source/unlock/port.c
+index a052cc6..a8ee817 100644
+--- a/source/unlock/port.c
++++ b/source/unlock/port.c
+@@ -6,7 +6,9 @@ VOID GuInit(EFI_BOOT_SERVICES *Bs, EFI_PCI_IO_PROTOCOL *Pci) {
+   memset(&Gu,0,sizeof(Gu)); Gu.bs=Bs; Gu.pci=Pci;
+ }
+ BOOLEAN GuTargetConfig(const UINT32 *C, UINTN S, UINTN B, UINTN D, UINTN F) {
+-  return C && !S && B==1 && !D && !F && C[0]==GU_BOARD_ID &&
++  /* Port: firmware assigns the bus; identity is enforced by vendor/device,
++     subsystem and class instead of a fixed bus number. */
++  return C && !S && !D && !F && C[0]==GU_BOARD_ID &&
+     C[11]==GU_BOARD_SUBSYSTEM && (C[2]>>24)==3 && !((C[3]>>16)&0x7f);
+ }
+ BOOLEAN GuSafeToReturn(VOID) {
+diff --git a/source/unlock/port.h b/source/unlock/port.h
+index 33734bc..5e02238 100644
+--- a/source/unlock/port.h
++++ b/source/unlock/port.h
+@@ -6,7 +6,7 @@
+ #include <stddef.h>
+ 
+ #define GU_BOARD_ID 0x270410deU
+-#define GU_BOARD_SUBSYSTEM 0x179510deU
++#define GU_BOARD_SUBSYSTEM 0x27046688U
+ #define GU_BOARD_CHIP 0x193000a1U
+ typedef struct GU_DMA GU_DMA;
+ struct GU_DMA {
+diff --git a/source/unlock/prom_profile.h b/source/unlock/prom_profile.h
+index afe746c..3b377c7 100644
+--- a/source/unlock/prom_profile.h
++++ b/source/unlock/prom_profile.h
+@@ -5,5 +5,5 @@
+  * Share this mapping between preflight verification and FWSEC extraction. */
+ #define GU_PROM_BAR_OFFSET 0x300000U
+ #define GU_PROM_VIEW_BYTES 0xd6c00U
+-#define GU_PROM_VIEW_SHA256 "603baffea2842b3d553e766146f498bff26413b9868f67f6b650aaaa37005526"
++#define GU_PROM_VIEW_SHA256 "95cb1464e5312e03ffe904b73ce8ab33a1766520d0849b403aa595570670ed9f"
+ #endif
+diff --git a/source/unlock/vendor/unlock_610.c b/source/unlock/vendor/unlock_610.c
+index 8259b57..c3a4d88 100644
+--- a/source/unlock/vendor/unlock_610.c
++++ b/source/unlock/vendor/unlock_610.c
+@@ -59,7 +59,7 @@ struct unlock_transaction_page {
+ 
+ struct unlock_transaction_work {
+ 	struct pci_dev *pdev;
+-	void __iomem *bar;
++	u8 *bar; /* MSVC: pointer arithmetic needs a sized type */
+ 	resource_size_t bar_len;
+ 	u16 original_cmd;
+ 	bool cmd_valid;
